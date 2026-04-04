@@ -195,6 +195,9 @@ def extract_pdf_segments(input_pdf: str, output_dir: str) -> dict:
 
         # ── Text blocks → segments ─────────────────────────────────────────
         for block in page.get("text_blocks", []):
+            # ❗ Skip text that belongs to tables
+            if _is_inside_table(block, page.get("tables", [])):
+                continue
             text = block.get("text", "").strip()
             if not text:
                 continue
@@ -241,7 +244,39 @@ def extract_pdf_segments(input_pdf: str, output_dir: str) -> dict:
 
             img_id += 1
 
+        # ── Tables → elements + segments ─────────────────────────────
+        for tbl in page.get("tables", []):
+            tid = f"table_{len(elements)}"
 
+            table_rows = []
+            
+            for row in tbl["rows"]:
+                new_row = []
+                for cell in row:
+                    if not cell or not str(cell).strip():
+                        new_row.append(None)
+                        continue
+
+                    seg_id = f"t_{text_id}"
+                    text_content[seg_id] = str(cell)
+
+                    new_row.append(seg_id)
+                    text_id += 1
+
+                table_rows.append(new_row)
+
+            elements.append({
+                "type": "table",
+                "id": tid,
+                "page": page_num,
+                "bbox": [
+                    tbl["bbox"]["x0"],
+                    tbl["bbox"]["y0"],
+                    tbl["bbox"]["x1"],
+                    tbl["bbox"]["y1"]
+                ],
+                "rows": table_rows   # ← NOW stores segment IDs
+            })
     # ── Build final structure ──────────────────────────────────────────────
     structure = {
         "elements": elements,
@@ -392,6 +427,20 @@ def _color_to_hex(color) -> Optional[str]:
         v = int(color * 255) if color <= 1.0 else int(color)
         return f"#{v:02x}{v:02x}{v:02x}"
     return None
+
+def _is_inside_table(block, tables):
+    bx0, by0, bx1, by1 = block["x0"], block["y0"], block["x1"], block["y1"]
+
+    for tbl in tables:
+        tx0 = tbl["bbox"]["x0"]
+        ty0 = tbl["bbox"]["y0"]
+        tx1 = tbl["bbox"]["x1"]
+        ty1 = tbl["bbox"]["y1"]
+
+        # Check overlap
+        if not (bx1 < tx0 or bx0 > tx1 or by1 < ty0 or by0 > ty1):
+            return True
+    return False
 
 # ─────────────────────────────────────────────
 #  DOCX PARSER

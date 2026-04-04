@@ -14,14 +14,14 @@ rebuilder.py
 
 import json
 from pathlib import Path
-
+from reportlab.platypus import Table, TableStyle
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont   # ✅ ADDED
+from reportlab.pdfbase.ttfonts import TTFont
 
 from PIL import Image
 
@@ -112,11 +112,19 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
                     "width": el["bbox"][2] - el["bbox"][0],
                     "height": el["bbox"][3] - el["bbox"][1],
                 })
+            elif el["type"] == "table":
+                flow_items.append({
+                    "type": "table",
+                    "rows": el["rows"],
+                    "x0": el["bbox"][0],
+                    "y1": el["bbox"][3],
+                    "y_anchor": el["bbox"][3],
+                    "width": el["bbox"][2] - el["bbox"][0],
+                })
 
         # SORT by reading order
-        flow_items.sort(key=lambda b: (-b["y1"], b["x0"]))
-
-        _draw_flow(c, flow_items, pw, ph)
+        flow_items.sort(key=lambda b: (-b.get("y_anchor", b["y1"]), b.get("x0", 0)))
+        _draw_flow(c, flow_items, pw, ph, text_content, translations)
 
         c.showPage()
 
@@ -142,7 +150,7 @@ def _pick_font(text: str) -> str:
 # FLOW ENGINE
 # ─────────────────────────────────────────────
 
-def _draw_flow(c, items, page_width, page_height):
+def _draw_flow(c, items, page_width, page_height, text_content, translations):
     styles = getSampleStyleSheet()
 
     LEFT = 40
@@ -215,6 +223,56 @@ def _draw_flow(c, items, page_width, page_height):
 
             except Exception:
                 pass
+        # ───────── TABLE ─────────
+        elif item["type"] == "table":
+            data = []
+            for row in item["rows"]:
+                new_row = []
+                for cell in row:
+                    if cell is None:
+                        new_row.append("")
+                    else:
+                        txt = translations.get(
+                            cell,
+                            text_content.get(cell, "")
+                        )
+                        styles = getSampleStyleSheet()
+                        cell_style = styles["Normal"]
+                        cell_style.fontName = _pick_font(txt)
+                        cell_style.fontSize = 9
+                        cell_style.leading = 11
+
+                        para = Paragraph(txt, cell_style)
+                        new_row.append(para)
+                data.append(new_row)
+            # Replace None with empty string
+            clean_data = [
+                [cell if cell is not None else "" for cell in row]
+                for row in data
+            ]
+
+            num_cols = max(len(r) for r in data) if data else 1
+            col_width = usable_width / num_cols
+            col_widths = [col_width] * num_cols
+            table = Table(clean_data, colWidths=col_widths)
+
+            table.setStyle(TableStyle([
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+
+            w, h = table.wrap(usable_width, page_height)
+
+            if y_cursor - h < BOTTOM:
+                c.showPage()
+                y_cursor = TOP
+
+            table.drawOn(c, LEFT, y_cursor - h)
+            y_cursor -= (h + 10)
 
 # ─────────────────────────────────────────────
 # FONT HELPER
