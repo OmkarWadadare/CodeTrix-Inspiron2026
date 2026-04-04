@@ -110,9 +110,11 @@ async def translate_document(request: DocumentTranslationRequest):
     session_dir = os.path.join(UPLOAD_DIR, request.session_id)
     ext = request.file_type
 
-    json_path = os.path.join(session_dir, "extracted",
-                             "pdf.json" if ext == "pdf" else "doc.json")
-
+    extracted_dir = os.path.join(session_dir, "extracted")
+    if ext == "pdf":
+        json_path = os.path.join(extracted_dir, "pdf.json")
+    else:
+        json_path = os.path.join(extracted_dir, "doc.json")
     glossary = get_glossary_by_lang_pair("en", request.target_lang)
     segment_texts = [s["text"] for s in request.segments]
     segment_ids   = [s["id"]   for s in request.segments]
