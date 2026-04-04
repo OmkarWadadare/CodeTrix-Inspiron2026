@@ -17,7 +17,6 @@ from pathlib import Path
 from reportlab.platypus import Table, TableStyle
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
@@ -27,6 +26,8 @@ from PIL import Image
 
 from docx import Document
 from docx.shared import Pt
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 
 # ─────────────────────────────────────────────
@@ -292,101 +293,118 @@ def _select_reportlab_font(bold: bool, italic: bool) -> str:
 # ─────────────────────────────────────────────
 
 def rebuild_docx_translated(json_path: str, translations: dict, output_docx: str) -> None:
-    """
-    Rebuild a translated DOCX from a segments.json produced by extract_docx_segments().
+    from docx import Document
+    from docx.shared import Pt
+    from pathlib import Path
+    import json
 
-    Parameters
-    ----------
-    json_path    : str   Path to segments.json
-    translations : dict  {segment_id: translated_text, ...}
-    output_docx  : str   Output DOCX path
-    """
     json_path = Path(json_path)
 
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    seg_map = {s["segment_id"]: s for s in data["segments"]}
-    assets  = data.get("assets", {})
+    elements     = data["elements"]
+    text_content = data["text_content"]
+    assets       = data.get("assets", {})
 
     doc = Document()
 
-    for elem in data["elements"]:
-        etype = elem["type"]
+    def resolve_text(seg_id):
+        return translations.get(seg_id, text_content.get(seg_id, "")).strip()
 
-        if etype == "paragraph":
-            p = doc.add_paragraph()
-            try:
-                p.style = elem["style"]
-            except KeyError:
-                p.style = "Normal"
+    # ─────────────────────────────
+    # FLOW (same concept as PDF)
+    # ─────────────────────────────
+    for el in elements:
 
-            for seg_id in elem.get("segment_ids", []):
-                if seg_id is None:
-                    # Preserve empty run as blank
-                    p.add_run("")
-                    continue
-                seg = seg_map.get(seg_id)
-                if seg is None:
-                    continue
-                text = translations.get(seg_id, seg["text"])
-                run = p.add_run(text)
-                run.bold      = seg.get("bold", False)
-                run.italic    = seg.get("italic", False)
-                run.underline = seg.get("underline", False)
-                fn = seg.get("font_name") or "Calibri"
-                run.font.name = fn
-                fs = seg.get("font_size")
-                if fs:
-                    run.font.size = Pt(fs)
-
-            # Inline images attached to this paragraph
-            for img_ref in elem.get("image_refs", []):
-                img_path = assets.get(img_ref)
-                if img_path and Path(img_path).exists():
-                    try:
-                        doc.add_picture(img_path)
-                    except Exception:
-                        pass
-
-        elif etype == "table":
-            rows = elem["rows"]
-            cols = elem["cols"]
-            if rows == 0 or cols == 0:
+        # ───────── TEXT ─────────
+        if el["type"] == "text":
+            text = resolve_text(el["id"])
+            if not text:
                 continue
 
-            table = doc.add_table(rows=rows, cols=cols)
+            p = doc.add_paragraph()
+            run = p.add_run(text)
 
-            for r_idx, row_data in enumerate(elem.get("cells", [])):
-                for c_idx, cell_data in enumerate(row_data):
-                    cell = table.cell(r_idx, c_idx)
-                    cell.text = ""
-                    p = cell.paragraphs[0]
+            flags = el.get("flags", 0)
+            run.bold   = bool(flags & 2)
+            run.italic = bool(flags & 1)
 
-                    style = cell_data.get("style")
-                    if style:
-                        try:
-                            p.style = style
-                        except KeyError:
-                            pass
+            if el.get("font"):
+                run.font.name = el["font"]
 
-                    for seg_id in cell_data.get("segment_ids", []):
+            if el.get("size"):
+                run.font.size = Pt(el["size"])
+
+        # ───────── IMAGE ─────────
+        elif el["type"] == "image":
+            asset = assets.get(el["id"])
+            if not asset:
+                continue
+
+            img_path = json_path.parent / asset["path"]
+
+            if img_path.exists():
+                try:
+                    doc.add_picture(str(img_path))
+                except Exception:
+                    pass
+
+        # ───────── TABLE ─────────
+        elif el["type"] == "table":
+            rows_data = el.get("rows", [])
+            if not rows_data:
+                continue
+
+            num_rows = len(rows_data)
+            num_cols = max(len(r) for r in rows_data)
+
+            table = doc.add_table(rows=num_rows, cols=num_cols)
+            set_table_borders(table)
+
+            for r_idx, row in enumerate(rows_data):
+                for c_idx, cell in enumerate(row):
+                    doc_cell = table.cell(r_idx, c_idx)
+                    doc_cell.text = ""
+
+                    p = doc_cell.paragraphs[0]
+
+                    # Each cell can have MULTIPLE segment IDs
+                    if isinstance(cell, list):
+                        seg_ids = cell
+                    else:
+                        seg_ids = [cell]
+
+                    for seg_id in seg_ids:
                         if seg_id is None:
                             p.add_run("")
                             continue
-                        seg = seg_map.get(seg_id)
-                        if seg is None:
+
+                        text = resolve_text(seg_id)
+                        if not text:
                             continue
-                        text = translations.get(seg_id, seg["text"])
+
                         run = p.add_run(text)
-                        run.bold      = seg.get("bold", False)
-                        run.italic    = seg.get("italic", False)
-                        run.underline = seg.get("underline", False)
-                        fn = seg.get("font_name") or "Calibri"
-                        run.font.name = fn
-                        fs = seg.get("font_size")
-                        if fs:
-                            run.font.size = Pt(fs)
+
+                        # Optional: style (DOCX doesn't store flags in your new pipeline)
+                        # Keeping simple like PDF table rendering
 
     doc.save(output_docx)
     print(f"[rebuild_docx_translated] → {output_docx}")
+
+def set_table_borders(table):
+    tbl = table._element
+    tblPr = tbl.tblPr
+
+    tblBorders = OxmlElement('w:tblBorders')
+
+    for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+        border = OxmlElement(f'w:{border_name}')
+        border.set(qn('w:val'), 'single')   # solid line
+        border.set(qn('w:sz'), '8')         # thickness (8 = ~1pt)
+        border.set(qn('w:space'), '0')
+        border.set(qn('w:color'), '000000') # black
+
+        tblBorders.append(border)
+
+    tblPr.append(tblBorders)

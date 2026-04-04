@@ -4,10 +4,9 @@ import requests
 import os
 
 BASE = "http://localhost:8000/api"
-TEST_FILE = "testdoc.pdf"   # make sure this exists in ./uploads/
-TARGET_LANG = "Hindi"
+TEST_FILE = "test_doc.docx"   # make sure this exists in ./uploads/
+TARGET_LANG = "Spanish"
 TONE = "Formal"
-
 
 def run():
     # ─────────────────────────────────────────────

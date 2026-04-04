@@ -16,7 +16,8 @@ def validate_segments(segments: list[str]) -> list[dict]:
 
         # 1. Spell check
         words = text.split()
-        misspelled = spell.unknown(words)
+        word_tokens = re.findall(r'\b\w+\b', text)
+        misspelled = spell.unknown(word_tokens)
         for w in misspelled:
             seg_issues.append({
                 "type": "SPELLING", "severity": "WARNING",

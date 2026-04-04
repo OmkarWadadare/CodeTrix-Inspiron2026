@@ -6,10 +6,9 @@ import zipfile
 import io
 from pathlib import Path
 from typing import Optional
-
+    
 import pypdfium2 as pdfium
 import pdfplumber
-from PIL import Image
 from docx import Document
 
 def extract_pdf_segments(input_pdf: str, output_dir: str) -> dict:
@@ -448,195 +447,138 @@ def _is_inside_table(block, tables):
 # ─────────────────────────────────────────────
 
 def extract_docx_segments(input_path: str, output_dir: str) -> dict:
-    """
-    Extract translatable text segments and images from a DOCX.
-
-    Returns
-    -------
-    dict with keys:
-        source_file  : str
-        segments     : list[dict]   flat list of translatable text segments
-        elements     : list[dict]   ordered document structure (for rebuilding)
-        images_dir   : str
-
-    Each segment dict:
-        segment_id   : str
-        element_ref  : str          links back to the element that owns it
-        run_index    : int | None   which run within a paragraph (-1 = table cell)
-        text         : str
-        bold         : bool
-        italic       : bool
-        underline    : bool
-        font_name    : str | None
-        font_size    : float | None
-        style        : str | None   paragraph style name
-        in_table     : bool
-        table_index  : int | None
-        row          : int | None
-        col          : int | None
-    """
+    
     output_dir = Path(output_dir)
     img_dir = output_dir / "images"
-    font_dir = output_dir / "fonts"
     output_dir.mkdir(parents=True, exist_ok=True)
     img_dir.mkdir(parents=True, exist_ok=True)
-    font_dir.mkdir(parents=True, exist_ok=True)
 
     doc = Document(input_path)
 
-    doc_data = {
-        "source_file": str(Path(input_path).resolve()),
-        "segments": [],
-        "elements": [],   # ordered rebuild blueprint
-        "images_dir": str(img_dir.resolve()),
-        "assets": {},     # image ref → absolute path
-        "fonts": {},
-    }
+    elements = []
+    text_content = {}
+    assets = {}
 
-    seg_counter = [0]
+    text_id = 0
+    img_id = 0
 
-    def new_seg_id():
-        seg_counter[0] += 1
-        return f"seg_{seg_counter[0]}"
+    def clean_text(text: str) -> str:
+        return text.replace("'", "").replace('"', "").strip()
 
-    # ── Fonts ─────────────────────────────────────────────────────────────
-    with zipfile.ZipFile(input_path, "r") as z:
-        for file in z.namelist():
-            if file.startswith("word/fonts/"):
-                font_name = os.path.basename(file)
-                font_path = str(font_dir / font_name)
-                with open(font_path, "wb") as f:
-                    f.write(z.read(file))
-                doc_data["fonts"][font_name] = font_path
-
-    # ── Images ────────────────────────────────────────────────────────────
-    rel_to_ref = {}
-    img_counter = 0
+    # ── Extract images ─────────────────────────────
+    rel_to_img = {}
     for rel in doc.part.rels.values():
         if "image" in rel.target_ref:
-            ref = f"img_{img_counter}"
-            img_path = str(img_dir / f"{ref}.png")
+            iid = f"img_{img_id}"
+            img_path = img_dir / f"{iid}.png"
+
             with open(img_path, "wb") as f:
                 f.write(rel.target_part.blob)
-            rel_to_ref[rel.rId] = ref
-            doc_data["assets"][ref] = img_path
-            img_counter += 1
 
-    # ── Paragraphs ────────────────────────────────────────────────────────
-    for para_idx, para in enumerate(doc.paragraphs):
-        elem_id = f"para_{para_idx}"
-        elem = {
-            "type": "paragraph",
-            "id": elem_id,
-            "style": para.style.name,
-            "segment_ids": [],
-            "image_refs": [],
-        }
+            rel_to_img[rel.rId] = iid
+            assets[iid] = {
+                "path": str(Path("images") / f"{iid}.png")
+            }
+            img_id += 1
 
-        for run_idx, run in enumerate(para.runs):
-            # Check if run contains an image
+    # ── Paragraphs ────────────────────────────────
+    for para in doc.paragraphs:
+        for run in para.runs:
+
+            # Handle images inside runs
             blips = run._element.xpath('.//a:blip')
             if blips:
                 rId = blips[0].attrib.get(
                     '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed'
                 )
-                if rId in rel_to_ref:
-                    elem["image_refs"].append(rel_to_ref[rId])
+                if rId in rel_to_img:
+                    iid = rel_to_img[rId]
 
-            text = run.text
-            if not text or not text.strip():
-                # Keep empty runs in element for fidelity but no segment
-                elem["segment_ids"].append(None)
+                    elements.append({
+                        "type": "image",
+                        "id": iid,
+                        "page": 0,   # DOCX has no pages
+                        "bbox": None
+                    })
+
+            text = clean_text(run.text)
+            if not text:
                 continue
 
-            seg_id = new_seg_id()
-            seg = {
-                "segment_id": seg_id,
-                "element_ref": elem_id,
-                "run_index": run_idx,
-                "text": text,
-                "bold": bool(run.bold),
-                "italic": bool(run.italic),
-                "underline": bool(run.underline),
-                "font_name": run.font.name,
-                "font_size": run.font.size.pt if run.font.size else None,
-                "style": para.style.name,
-                "in_table": False,
-                "table_index": None,
-                "row": None,
-                "col": None,
-            }
-            doc_data["segments"].append(seg)
-            elem["segment_ids"].append(seg_id)
+            tid = f"t_{text_id}"
 
-        doc_data["elements"].append(elem)
+            elements.append({
+                "type": "text",
+                "id": tid,
+                "page": 0,
+                "bbox": None,
+                "size": run.font.size.pt if run.font.size else None,
+                "font": run.font.name,
+                "color": None,
+                "flags": (
+                    (2 if run.bold else 0) |
+                    (1 if run.italic else 0)
+                )
+            })
 
-    # ── Tables ────────────────────────────────────────────────────────────
-    for tbl_idx, table in enumerate(doc.tables):
-        elem_id = f"table_{tbl_idx}"
-        elem = {
-            "type": "table",
-            "id": elem_id,
-            "rows": len(table.rows),
-            "cols": len(table.columns),
-            "cells": [],   # list of rows; each row = list of {segment_ids, style}
-        }
+            text_content[tid] = text
+            text_id += 1
 
-        for r_idx, row in enumerate(table.rows):
-            row_data = []
-            for c_idx, cell in enumerate(row.cells):
-                cell_seg_ids = []
-                cell_style = None
+    # ── Tables ────────────────────────────────────
+    for table in doc.tables:
+        table_rows = []
+
+        for row in table.rows:
+            new_row = []
+
+            for cell in row.cells:
+                cell_segments = []
 
                 for para in cell.paragraphs:
-                    if cell_style is None:
-                        cell_style = para.style.name
+                    for run in para.runs:
+                        text = clean_text(run.text)
 
-                    for run_idx, run in enumerate(para.runs):
-                        text = run.text
-                        if not text or not text.strip():
-                            cell_seg_ids.append(None)
+                        if not text:
+                            cell_segments.append(None)
                             continue
-                        seg_id = new_seg_id()
-                        seg = {
-                            "segment_id": seg_id,
-                            "element_ref": elem_id,
-                            "run_index": run_idx,
-                            "text": text,
-                            "bold": bool(run.bold),
-                            "italic": bool(run.italic),
-                            "underline": bool(run.underline),
-                            "font_name": run.font.name,
-                            "font_size": run.font.size.pt if run.font.size else None,
-                            "style": cell_style,
-                            "in_table": True,
-                            "table_index": tbl_idx,
-                            "row": r_idx,
-                            "col": c_idx,
-                        }
-                        doc_data["segments"].append(seg)
-                        cell_seg_ids.append(seg_id)
 
-                row_data.append({"segment_ids": cell_seg_ids, "style": cell_style})
+                        seg_id = f"t_{text_id}"
+                        text_content[seg_id] = text
+                        cell_segments.append(seg_id)
+                        text_id += 1
 
-            elem["cells"].append(row_data)
+                new_row.append(cell_segments if cell_segments else [None])
 
-        doc_data["elements"].append(elem)
+            table_rows.append(new_row)
+
+        elements.append({
+            "type": "table",
+            "id": f"table_{len(elements)}",
+            "page": 0,
+            "bbox": None,
+            "rows": table_rows
+        })
+
+    # ── Final structure (MATCHES PDF OUTPUT) ──────
+    structure = {
+        "elements": elements,
+        "text_content": text_content,
+        "assets": assets,
+        "pages": {
+            0: {"width": None, "height": None}
+        }
+    }
 
     json_path = output_dir / "doc.json"
-
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(doc_data, f, indent=2, ensure_ascii=False)
+        json.dump(structure, f, indent=2, ensure_ascii=False)
 
-    print(f"[extract_docx_segments] {len(doc_data['segments'])} segments → {json_path}")
-
-    # ✅ RETURN CORRECT STRUCTURE
-    segments = [{"id": s["segment_id"], "text": s["text"]} for s in doc_data["segments"]]
+    segments = [{"id": k, "text": v} for k, v in text_content.items()]
 
     return {
         "json_path": str(json_path),
         "segments": segments,
-        "structure": doc_data
+        "structure": structure
     }
 
 # ─────────────────────────────────────────────
