@@ -8,15 +8,21 @@ rebuild_docx_translated(json_path, translations, output_docx)
 Any segment_id not present in `translations` falls back to its original text.
 """
 
+"""
+rebuilder.py
+"""
+
 import json
 from pathlib import Path
 
 from reportlab.lib import colors
-from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont   # ✅ ADDED
+
 from PIL import Image
 
 from docx import Document
@@ -26,6 +32,22 @@ from docx.shared import Pt
 # ─────────────────────────────────────────────
 #  PDF REBUILDER
 # ─────────────────────────────────────────────
+
+FONT_DIR = Path(__file__).parent / "fonts"
+
+FONTS = {
+    "latin": FONT_DIR / "NotoSans-Regular.ttf",
+    "devanagari": FONT_DIR / "NotoSansDevanagari-Regular.ttf",
+    "tamil": FONT_DIR / "NotoSansTamil-Regular.ttf",
+    "arabic": FONT_DIR / "NotoSansArabic-Regular.ttf",
+    "chinese": FONT_DIR / "NotoSansSC-Regular.ttf",
+    "fallback": FONT_DIR / "NotoSansSymbols-Regular.ttf",
+}
+
+for name, path in FONTS.items():
+    pdfmetrics.registerFont(TTFont(name, str(path)))
+
+
 
 def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) -> None:
     json_path = Path(json_path)
@@ -49,12 +71,7 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
 
         c.setPageSize((pw, ph))
 
-        page_data = {
-            "text_blocks": [],
-            "tables": [],
-            "images": [],
-            "links": []
-        }
+        flow_items = []
 
         for el in elements:
             if el["page"] != i:
@@ -72,93 +89,60 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
                 x0, y0, x1, y1 = el["bbox"]
                 flags = el.get("flags", 0)
 
-                block = {
+                flow_items.append({
+                    "type": "text",
                     "text": raw_text,
                     "x0": x0,
-                    "y0": y0,
-                    "x1": x1,
                     "y1": y1,
                     "size": el.get("size", 10),
                     "bold": bool(flags & 2),
                     "italic": bool(flags & 1),
-                    "color": el.get("color"),
-                    "role": "body"
-                }
-
-                page_data["text_blocks"].append(block)
+                })
 
             elif el["type"] == "image":
                 asset = assets.get(el["id"])
                 if not asset:
                     continue
 
-                page_data["images"].append({
-                    "file": asset["path"],
-                    "bbox": {
-                        "x0": el["bbox"][0],
-                        "y0": el["bbox"][1],
-                        "x1": el["bbox"][2],
-                        "y1": el["bbox"][3],
-                    }
+                flow_items.append({
+                    "type": "image",
+                    "path": json_path.parent / asset["path"],
+                    "x0": el["bbox"][0],
+                    "y1": el["bbox"][3],
+                    "width": el["bbox"][2] - el["bbox"][0],
+                    "height": el["bbox"][3] - el["bbox"][1],
                 })
 
-            elif el["type"] == "link":
-                page_data["links"].append({
-                    "bbox": {
-                        "x0": el["bbox"][0],
-                        "y0": el["bbox"][1],
-                        "x1": el["bbox"][2],
-                        "y1": el["bbox"][3],
-                    },
-                    "url": el.get("url")
-                })
+        # SORT by reading order
+        flow_items.sort(key=lambda b: (-b["y1"], b["x0"]))
 
-            elif el["type"] == "table":
-                page_data["tables"].append(el)
-
-        table_bboxes = [
-            tbl["bbox"]
-            for tbl in page_data.get("tables", [])
-            if tbl.get("bbox")
-        ]
-
-        # ─────────────────────────────────────────────
-        # FLOW TEXT (UPDATED LOGIC)
-        # ─────────────────────────────────────────────
-        flow_blocks = [
-            b for b in page_data.get("text_blocks", [])
-            if not _block_inside_table(b, table_bboxes)
-        ]
-
-        _draw_flowing_text(c, flow_blocks, pw, ph)
-
-        # TABLES
-        for table in page_data.get("tables", []):
-            _draw_table(c, table, ph)
-
-        # IMAGES
-        for img_info in page_data.get("images", []):
-            _draw_image(c, img_info, json_path.parent, ph)
-
-        # LINKS
-        for link in page_data.get("links", []):
-            _draw_link(c, link)
+        _draw_flow(c, flow_items, pw, ph)
 
         c.showPage()
 
     c.save()
     print(f"[rebuild_pdf_translated] → {output_pdf}")
 
+def _pick_font(text: str) -> str:
+    for ch in text:
+        code = ord(ch)
+
+        if 0x0900 <= code <= 0x097F:
+            return "devanagari"
+        elif 0x0B80 <= code <= 0x0BFF:
+            return "tamil"
+        elif 0x0600 <= code <= 0x06FF:
+            return "arabic"
+        elif 0x4E00 <= code <= 0x9FFF:
+            return "chinese"
+
+    return "latin"
 
 # ─────────────────────────────────────────────
-# FLOW TEXT HELPERS
+# FLOW ENGINE
 # ─────────────────────────────────────────────
 
-def _sort_blocks_reading_order(blocks):
-    return sorted(blocks, key=lambda b: (-b["y1"], b["x0"]))
-
-
-def _draw_flowing_text(c, blocks, page_width, page_height):
+def _draw_flow(c, items, page_width, page_height):
     styles = getSampleStyleSheet()
 
     LEFT = 40
@@ -169,44 +153,72 @@ def _draw_flowing_text(c, blocks, page_width, page_height):
     usable_width = page_width - LEFT - RIGHT
     y_cursor = TOP
 
-    blocks = _sort_blocks_reading_order(blocks)
+    for item in items:
 
-    for block in blocks:
-        text = block["text"].strip()
-        if not text:
-            continue
+        # ───────── TEXT ─────────
+        if item["type"] == "text":
+            text = item["text"]
 
-        style = styles["Normal"]
-        style.fontName = _select_reportlab_font(
-            block.get("bold", False),
-            block.get("italic", False)
-        )
-        style.fontSize = block.get("size", 11)
-        style.leading = style.fontSize + 2
+            style = styles["Normal"]
+            style.fontName = _pick_font(text)
+            style.fontSize = item.get("size", 11)
+            style.leading = style.fontSize + 2
 
-        para = Paragraph(text, style)
-        w, h = para.wrap(usable_width, page_height)
+            # Detect bullets
+            if text.strip().startswith(("•", "-", "*")):
+                text = f"&bull; {text.lstrip('•-* ').strip()}"
+                style.leftIndent = 10
 
-        if y_cursor - h < BOTTOM:
-            c.showPage()
-            y_cursor = TOP
+            para = Paragraph(text, style)
+            w, h = para.wrap(usable_width, page_height)
 
-        para.drawOn(c, LEFT, y_cursor - h)
-        y_cursor -= (h + 6)
+            if y_cursor - h < BOTTOM:
+                c.showPage()
+                y_cursor = TOP
 
+            para.drawOn(c, LEFT, y_cursor - h)
+            y_cursor -= (h + 6)
+
+        # ───────── IMAGE ─────────
+        elif item["type"] == "image":
+            path = item["path"]
+
+            if not path.exists():
+                continue
+
+            try:
+                w = item["width"]
+                h = item["height"]
+
+                # If image too wide, scale proportionally
+                if w > usable_width:
+                    scale = usable_width / w
+                    w *= scale
+                    h *= scale
+
+                # Page break if needed
+                if y_cursor - h < BOTTOM:
+                    c.showPage()
+                    y_cursor = TOP
+
+                c.drawImage(
+                    str(path),
+                    LEFT,
+                    y_cursor - h,
+                    width=w,
+                    height=h,
+                    preserveAspectRatio=True,
+                    mask='auto'
+                )
+
+                y_cursor -= (h + 10)
+
+            except Exception:
+                pass
 
 # ─────────────────────────────────────────────
-# ORIGINAL HELPERS (UNCHANGED)
+# FONT HELPER
 # ─────────────────────────────────────────────
-
-def _block_inside_table(block: dict, table_bboxes: list) -> bool:
-    cx = (block["x0"] + block["x1"]) / 2
-    cy = (block["y0"] + block["y1"]) / 2
-    for bbox in table_bboxes:
-        if bbox["x0"] <= cx <= bbox["x1"] and bbox["y0"] <= cy <= bbox["y1"]:
-            return True
-    return False
-
 
 def _select_reportlab_font(bold: bool, italic: bool) -> str:
     if bold and italic:
@@ -216,157 +228,6 @@ def _select_reportlab_font(bold: bool, italic: bool) -> str:
     if italic:
         return "Helvetica-Oblique"
     return "Helvetica"
-
-def _draw_table(c: canvas.Canvas, table: dict, page_height: float) -> None:
-    rows = table.get("rows", [])
-    bbox = table.get("bbox", {})
-    if not rows or not bbox:
-        return
-
-    # ── ORIGINAL TABLE SIZE (FIXED) ─────────────────────────────────────
-    x0, y0, x1, y1 = bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"]
-    table_w = x1 - x0
-    table_h = y1 - y0
-
-    num_rows = len(rows)
-    num_cols = max((len(r) for r in rows), default=1)
-
-    col_w = table_w / num_cols
-    row_h = table_h / num_rows
-
-    CELL_PAD = 4
-
-    # Normalize rows
-    norm_rows = [list(r) + [""] * (num_cols - len(r)) for r in rows]
-
-    # ── Step 1: Find MAX font size that fits ALL cells ───────────────────
-    def fits(font_size):
-        for i, row in enumerate(norm_rows):
-            font = "Helvetica-Bold" if i == 0 else "Helvetica"
-            c.setFont(font, font_size)
-
-            for j, cell in enumerate(row):
-                text = str(cell)
-                lines = text.split("\n")
-
-                # vertical check
-                needed_h = len(lines) * (font_size + 2)
-                if needed_h > (row_h - 2 * CELL_PAD):
-                    return False
-
-                # horizontal check
-                for line in lines:
-                    if c.stringWidth(line, font, font_size) > (col_w - 2 * CELL_PAD):
-                        return False
-        return True
-
-    # Binary search font size
-    low, high = 4, 14
-    best_size = 6
-
-    while low <= high:
-        mid = (low + high) // 2
-        if fits(mid):
-            best_size = mid
-            low = mid + 1
-        else:
-            high = mid - 1
-
-    FONT_SIZE = best_size
-    LINE_H = FONT_SIZE + 2
-
-    # ── Header shading ──────────────────────────────────────────────────
-    c.setFillColorRGB(0.85, 0.85, 0.85)
-    c.rect(x0, y1 - row_h, table_w, row_h, fill=1, stroke=0)
-    c.setFillColor(colors.black)
-
-    # ── Grid ────────────────────────────────────────────────────────────
-    c.setStrokeColor(colors.black)
-    c.setLineWidth(0.5)
-
-    # Horizontal lines
-    for i in range(num_rows + 1):
-        y = y1 - i * row_h
-        c.line(x0, y, x1, y)
-
-    # Vertical lines
-    for j in range(num_cols + 1):
-        x = x0 + j * col_w
-        c.line(x, y0, x, y1)
-
-    # ── Draw text (FIT INSIDE CELLS) ────────────────────────────────────
-    for i, row in enumerate(norm_rows):
-        font = "Helvetica-Bold" if i == 0 else "Helvetica"
-        c.setFont(font, FONT_SIZE)
-
-        for j, cell in enumerate(row):
-            text = str(cell)
-            lines = text.split("\n")
-
-            tx = x0 + j * col_w + CELL_PAD
-            ty = y1 - i * row_h - CELL_PAD - LINE_H
-
-            for line in lines:
-                c.drawString(tx, ty, line)
-                ty -= LINE_H
-
-    # Reset
-    c.setFont("Helvetica", 11)
-    c.setFillColor(colors.black)
-
-def _draw_image(c: canvas.Canvas, img_info: dict,
-                data_dir: Path, page_height: float) -> None:
-    """Place an extracted image onto the canvas at the stored position."""
-    rel_path = img_info.get("file")
-    if not rel_path:
-        return
-
-    img_path = data_dir / rel_path
-    if not img_path.exists():
-        return
-
-    bbox = img_info.get("bbox", {})
-    x0   = bbox.get("x0", 0)
-    y0   = bbox.get("y0", 0)   # bottom-left in PDF coords
-    x1   = bbox.get("x1", x0 + 100)
-    y1   = bbox.get("y1", y0 + 100)
-    w    = max(x1 - x0, 1)
-    h    = max(y1 - y0, 1)
-
-    try:
-        pil_img = Image.open(img_path)
-        img_reader = ImageReader(pil_img)
-        c.drawImage(img_reader, x0, y0, width=w, height=h,
-                    preserveAspectRatio=True, mask="auto")
-    except Exception as e:
-        # Draw a placeholder box if image can't be rendered
-        c.setStrokeColor(colors.grey)
-        c.setFillColorRGB(0.95, 0.95, 0.95)
-        c.rect(x0, y0, w, h, fill=1)
-        c.setFillColor(colors.grey)
-        c.setFont("Helvetica", 8)
-        c.drawCentredString(x0 + w / 2, y0 + h / 2, "[image]")
-        c.setFillColor(colors.black)
-
-def _draw_link(c: canvas.Canvas, link: dict) -> None:
-    bbox = link.get("bbox", {})
-    url  = link.get("url")
-
-    if not bbox or not url:
-        return
-
-    x0 = bbox["x0"]
-    y0 = bbox["y0"]
-    x1 = bbox["x1"]
-    y1 = bbox["y1"]
-
-    # Invisible clickable area
-    c.linkURL(
-        url,
-        (x0, y0, x1, y1),
-        relative=0,
-        thickness=0
-    )
 
 # ─────────────────────────────────────────────
 #  DOCX REBUILDER
