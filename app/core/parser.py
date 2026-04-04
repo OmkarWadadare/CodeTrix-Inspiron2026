@@ -199,6 +199,7 @@ def extract_pdf_segments(input_pdf: str, output_dir: str) -> dict:
             if _is_inside_table(block, page.get("tables", [])):
                 continue
             text = block.get("text", "").strip()
+            text = text.replace("'", "").replace('"', "")
             if not text:
                 continue
 
@@ -258,8 +259,8 @@ def extract_pdf_segments(input_pdf: str, output_dir: str) -> dict:
                         continue
 
                     seg_id = f"t_{text_id}"
-                    text_content[seg_id] = str(cell)
-
+                    cell_text = str(cell).replace("'", "").replace('"', "")
+                    text_content[seg_id] = cell_text
                     new_row.append(seg_id)
                     text_id += 1
 
