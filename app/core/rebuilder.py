@@ -15,6 +15,8 @@ from reportlab.lib import colors
 from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+from reportlab.platypus import Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 from PIL import Image
 
 from docx import Document
@@ -26,18 +28,6 @@ from docx.shared import Pt
 # ─────────────────────────────────────────────
 
 def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) -> None:
-    """
-    Rebuild PDF from segment-based JSON using helper rendering pipeline.
-
-    Parameters
-    ----------
-    json_path : str
-        Path to pdf.json (segment format)
-    translations : dict
-        {segment_id: translated_text}
-    output_pdf : str
-        Output PDF path
-    """
     json_path = Path(json_path)
 
     with open(json_path, "r", encoding="utf-8") as f:
@@ -59,9 +49,6 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
 
         c.setPageSize((pw, ph))
 
-        # ─────────────────────────────────────────────
-        # Build page_data (convert to helper format)
-        # ─────────────────────────────────────────────
         page_data = {
             "text_blocks": [],
             "tables": [],
@@ -73,7 +60,6 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
             if el["page"] != i:
                 continue
 
-            # ── TEXT → text_blocks ───────────────────
             if el["type"] == "text":
                 raw_text = translations.get(
                     el["id"],
@@ -101,7 +87,6 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
 
                 page_data["text_blocks"].append(block)
 
-            # ── IMAGE → images ───────────────────────
             elif el["type"] == "image":
                 asset = assets.get(el["id"])
                 if not asset:
@@ -117,7 +102,6 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
                     }
                 })
 
-            # ── LINK (if exists in your format) ──────
             elif el["type"] == "link":
                 page_data["links"].append({
                     "bbox": {
@@ -129,13 +113,8 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
                     "url": el.get("url")
                 })
 
-            # ── TABLE (if your JSON has it) ──────────
             elif el["type"] == "table":
                 page_data["tables"].append(el)
-
-        # ─────────────────────────────────────────────
-        # Rendering using helpers
-        # ─────────────────────────────────────────────
 
         table_bboxes = [
             tbl["bbox"]
@@ -143,11 +122,15 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
             if tbl.get("bbox")
         ]
 
-        # TEXT (skip ones inside tables)
-        for block in page_data.get("text_blocks", []):
-            if _block_inside_table(block, table_bboxes):
-                continue
-            _draw_text_block(c, block, ph)
+        # ─────────────────────────────────────────────
+        # FLOW TEXT (UPDATED LOGIC)
+        # ─────────────────────────────────────────────
+        flow_blocks = [
+            b for b in page_data.get("text_blocks", [])
+            if not _block_inside_table(b, table_bboxes)
+        ]
+
+        _draw_flowing_text(c, flow_blocks, pw, ph)
 
         # TABLES
         for table in page_data.get("tables", []):
@@ -166,12 +149,57 @@ def rebuild_pdf_translated(json_path: str, translations: dict, output_pdf: str) 
     c.save()
     print(f"[rebuild_pdf_translated] → {output_pdf}")
 
+
+# ─────────────────────────────────────────────
+# FLOW TEXT HELPERS
+# ─────────────────────────────────────────────
+
+def _sort_blocks_reading_order(blocks):
+    return sorted(blocks, key=lambda b: (-b["y1"], b["x0"]))
+
+
+def _draw_flowing_text(c, blocks, page_width, page_height):
+    styles = getSampleStyleSheet()
+
+    LEFT = 40
+    RIGHT = 40
+    TOP = page_height - 40
+    BOTTOM = 40
+
+    usable_width = page_width - LEFT - RIGHT
+    y_cursor = TOP
+
+    blocks = _sort_blocks_reading_order(blocks)
+
+    for block in blocks:
+        text = block["text"].strip()
+        if not text:
+            continue
+
+        style = styles["Normal"]
+        style.fontName = _select_reportlab_font(
+            block.get("bold", False),
+            block.get("italic", False)
+        )
+        style.fontSize = block.get("size", 11)
+        style.leading = style.fontSize + 2
+
+        para = Paragraph(text, style)
+        w, h = para.wrap(usable_width, page_height)
+
+        if y_cursor - h < BOTTOM:
+            c.showPage()
+            y_cursor = TOP
+
+        para.drawOn(c, LEFT, y_cursor - h)
+        y_cursor -= (h + 6)
+
+
+# ─────────────────────────────────────────────
+# ORIGINAL HELPERS (UNCHANGED)
+# ─────────────────────────────────────────────
+
 def _block_inside_table(block: dict, table_bboxes: list) -> bool:
-    """
-    Return True if the block's centre point falls within any table bounding box.
-    Using the centre (rather than full overlap) handles blocks that slightly
-    straddle a table border due to coordinate rounding.
-    """
     cx = (block["x0"] + block["x1"]) / 2
     cy = (block["y0"] + block["y1"]) / 2
     for bbox in table_bboxes:
@@ -180,51 +208,7 @@ def _block_inside_table(block: dict, table_bboxes: list) -> bool:
     return False
 
 
-def _draw_text_block(c: canvas.Canvas, block: dict, page_height: float) -> None:
-    """Render a text block onto the ReportLab canvas."""
-    text  = block.get("text", "").strip()
-    if not text:
-        return
-
-    x0   = block["x0"]
-    y0   = block["y0"]   # already in PDF coords (bottom-left origin)
-    size = block.get("size", 11)
-    bold   = block.get("bold", False)
-    italic = block.get("italic", False)
-    color_hex = block.get("color")
-
-    # Font selection
-    font_name = _select_reportlab_font(bold, italic)
-    try:
-        c.setFont(font_name, size)
-    except Exception:
-        c.setFont("Helvetica", size)
-
-    # Color
-    if color_hex:
-        try:
-            c.setFillColor(HexColor(color_hex))
-        except Exception:
-            c.setFillColor(colors.black)
-    else:
-        c.setFillColor(colors.black)
-
-    # Role-based decorations
-    role = block.get("role", "body")
-    if role in ("h1", "h2", "h3"):
-        # Underline headings
-        tw = c.stringWidth(text, font_name, size)
-        c.line(x0, y0 - 1, x0 + tw, y0 - 1)
-
-    # Render text
-    c.drawString(x0, y0, text)
-
-    # Reset color
-    c.setFillColor(colors.black)
-
-
 def _select_reportlab_font(bold: bool, italic: bool) -> str:
-    """Map bold/italic flags to a built-in ReportLab font name."""
     if bold and italic:
         return "Helvetica-BoldOblique"
     if bold:
@@ -232,7 +216,6 @@ def _select_reportlab_font(bold: bool, italic: bool) -> str:
     if italic:
         return "Helvetica-Oblique"
     return "Helvetica"
-
 
 def _draw_table(c: canvas.Canvas, table: dict, page_height: float) -> None:
     rows = table.get("rows", [])
