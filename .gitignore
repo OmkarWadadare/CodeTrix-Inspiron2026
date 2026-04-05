@@ -1,8 +1,0 @@
-venv/
-*.pyc
-__pycache__/
-.env
-*.db
-outputs/
-uploads/
-test_translation.py
