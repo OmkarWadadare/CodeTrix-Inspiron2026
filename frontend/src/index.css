@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-midnight text-white min-h-screen font-sans overflow-x-hidden;
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply bg-white/10 backdrop-blur-md border border-white/20 shadow-[0_4px_30px_rgba(0,0,0,0.1)];
+  }
+  .glass-dark {
+    @apply bg-black/20 backdrop-blur-xl border border-white/10 shadow-[0_8px_32px_rgba(0,0,0,0.3)];
+  }
+  .glass-panel {
+    @apply bg-space/20 backdrop-blur-lg border border-gold/20 shadow-[0_8px_32px_rgba(242,174,46,0.1)];
+  }
+}

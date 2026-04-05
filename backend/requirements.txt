@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+chromadb
+sentence-transformers
+langchain
+python-dotenv
+pydantic
+groq
+pyspellchecker
+pdfplumber
+python-docx
+PyMuPDF
+pypdfium2
+reportlab
+Pillow
+python-multipart
